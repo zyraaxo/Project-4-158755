@@ -4,7 +4,7 @@ from newsapi import NewsApiClient
 from engagement_model import preprocess_and_train
 
 # --- Initialize News API ---
-API_KEY = "7af7d5e56edc4148aac908f2c9f86ac3"  # Use your own API key if needed
+API_KEY = "7af7d5e56edc4148aac908f2c9f86ac3"  
 newsapi = NewsApiClient(api_key=API_KEY)
 
 st.title("📊 Real-Time Social + News Dashboard with Engagement Forecasting")
