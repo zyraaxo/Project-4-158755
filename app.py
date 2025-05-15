@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+import ast
+from textblob import TextBlob
 
 # Page config
 st.set_page_config(page_title="Social Media Trend Forecaster", layout="wide")
@@ -31,12 +33,21 @@ keyword = selected_trend if st.session_state.get("use_trend", False) else keywor
 try:
     df = pd.read_csv("data/x_posts_with_weather.csv")
     df["created_at"] = pd.to_datetime(df["created_at"])
+    df["hashtags"] = df["hashtags"].apply(ast.literal_eval)  # convert string list to real list
+
+    # Live sentiment analysis simulation using TextBlob
+    def analyze_sentiment(text):
+        polarity = TextBlob(text).sentiment.polarity
+        return "POSITIVE" if polarity >= 0 else "NEGATIVE"
+
+    df["sentiment"] = df["text"].apply(analyze_sentiment)
+
 except FileNotFoundError:
     st.error("Data file not found. Please run generate_placeholder_posts.py.")
     st.stop()
 
 # Filter data
-df = df[df["hashtags"].str.contains(keyword, case=False)]
+df = df[df["hashtags"].apply(lambda tags: any(keyword.lower() in h.lower() for h in tags))]
 df = df[df["sentiment"].isin(sentiment_filter)]
 df = df[df["created_at"] >= df["created_at"].max() - pd.Timedelta(hours=date_range)]
 
@@ -46,7 +57,7 @@ st.header("Trend Insights")
 # Word cloud
 st.subheader("Related Hashtags")
 if not df.empty:
-    all_hashtags = [htag for sublist in df["hashtags"].apply(eval) for htag in sublist]
+    all_hashtags = [htag for sublist in df["hashtags"] for htag in sublist]
     if all_hashtags:
         wordcloud = WordCloud(width=800, height=400, background_color="white").generate(" ".join(all_hashtags))
         plt.figure(figsize=(10, 5))
@@ -75,6 +86,18 @@ if not df.empty:
 else:
     st.write("No engagement data available.")
 
+# Hourly engagement breakdown
+st.subheader("Hourly Engagement Breakdown")
+if not df.empty:
+    hourly_df = df.groupby("hour_of_day")["engagement"].mean().reset_index()
+    fig2 = px.line(hourly_df, x="hour_of_day", y="engagement", markers=True,
+                   title="Average Engagement by Hour",
+                   labels={"hour_of_day": "Hour of Day", "engagement": "Avg Engagement"})
+    fig2.update_layout(xaxis=dict(dtick=1))
+    st.plotly_chart(fig2, use_container_width=True)
+else:
+    st.write("No data available for hourly trends.")
+
 # Insights
 st.header("Actionable Insights")
 if not df.empty:
@@ -82,7 +105,6 @@ if not df.empty:
     weather_impact = df.groupby("precipitation")["engagement"].mean().idxmax()
     st.markdown(f"""
     - **Optimal Posting Time**: Post {keyword} around {peak_hour}:00 for maximum engagement.
-    - **Weather Impact**: Engagement is highest when precipitation is {weather_impact:.1f} mm.
     - **Recommendation**: Share positive {keyword} content during peak hours on clear days.
     """)
 else:
