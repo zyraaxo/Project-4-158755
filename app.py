@@ -1,17 +1,18 @@
 import streamlit as st
-from newsapi import NewsApiClient
 import pandas as pd
+from newsapi import NewsApiClient
+from engagement_model import preprocess_and_train
 
-# Initialize NewsApiClient
-API_KEY = "7af7d5e56edc4148aac908f2c9f86ac3"  # Replace with your key or keep for testing
+# --- Initialize News API ---
+API_KEY = "7af7d5e56edc4148aac908f2c9f86ac3"  # Use your own API key if needed
 newsapi = NewsApiClient(api_key=API_KEY)
 
-st.title("Interactive Data Journalism Dashboard: Social Media + News")
+st.title("📊 Real-Time Social + News Dashboard with Engagement Forecasting")
 
-# User input for topic
+# --- User Topic Input ---
 topic = st.text_input("Enter a topic keyword (e.g., #Fitness, climate change):", "#Fitness")
 
-# Fetch news articles related to topic
+# --- News Fetching ---
 if topic:
     with st.spinner("Fetching news articles..."):
         all_articles = newsapi.get_everything(
@@ -22,7 +23,7 @@ if topic:
         )
     articles = all_articles.get('articles', [])
 
-    st.header(f"Latest News on {topic}")
+    st.header(f"📰 Latest News on {topic}")
     if articles:
         for article in articles:
             st.subheader(article['title'])
@@ -33,22 +34,21 @@ if topic:
     else:
         st.write("No news articles found for this topic.")
 
-
-# Load your social media data (assuming you have a CSV with hashtag data)
+# --- Load Dataset ---
 @st.cache_data
 def load_social_data():
     df = pd.read_csv("data/x_posts_with_weather.csv")
-    df['created_at'] = pd.to_datetime(df['created_at'])
+    df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
     return df
-
 
 df = load_social_data()
 
-# Filter social media data by topic/hashtag
+# --- Filter Dataset ---
 if topic:
     mask = df['hashtags'].str.contains(topic.replace("#", ""), case=False, na=False)
     filtered_df = df[mask]
-    st.header(f"Social Media Posts on {topic}")
+
+    st.header(f"📱 Social Media Posts on {topic}")
     st.write(f"Total posts found: {filtered_df.shape[0]}")
 
     if not filtered_df.empty:
@@ -56,4 +56,28 @@ if topic:
     else:
         st.write("No social media posts found for this topic.")
 
-# Add more interactive filters and charts as needed
+# --- ML Model Integration ---
+if not filtered_df.empty:
+    st.subheader("📈 Predicting Engagement (Likes + Retweets)")
+
+    # Rename for compatibility with model
+    if 'created_at' in filtered_df.columns:
+        filtered_df = filtered_df.rename(columns={"created_at": "timestamp"})
+
+    try:
+        with st.spinner("Training ML model..."):
+            result = preprocess_and_train(filtered_df)
+
+        st.success("Model trained successfully!")
+
+        st.write(f"**R² Score**: {result['r2_score']:.2f}")
+        st.write(f"**RMSE**: {result['rmse']:.2f}")
+
+        chart_df = result['X_test'].copy()
+        chart_df['Predicted Engagement'] = result['y_pred']
+        chart_df['Actual Engagement'] = result['y_test'].values
+
+        st.line_chart(chart_df[['Predicted Engagement', 'Actual Engagement']])
+
+    except Exception as e:
+        st.error(f"Model error: {e}")
