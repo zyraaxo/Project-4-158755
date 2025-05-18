@@ -1,5 +1,7 @@
 How to run:
 
-Clone directory from main branch
-Run the data file(s)
-In venv terminal run streamlit app.py
+1. Clone directory from main branch
+2. Run the data file(s).
+3. Run the merge file after parameters and raw data is there.
+  
+5. In venv terminal run streamlit app.py
