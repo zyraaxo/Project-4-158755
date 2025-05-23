@@ -17,3 +17,14 @@ Objectives
     Visualize Insights in a Streamlit app with interactive plots, word clouds, and filters.
 
     Ensure Originality by generating a custom dataset augmented with live news and weather data, avoiding API limitations and overused public datasets.
+
+
+How to run:
+
+    Clone directory from main branch
+    run requirements.txt via terminal "pip install -r requirements.txt"
+    Run nltk script.py ONCE only. This is for NLP
+    Run the data file(s). This includes. redditAPI.py, engagement_model.py
+    Run the merge file after parameters and raw data is there. The merge file is called "mergeDATA.py"
+    In venv terminal run streamlit app.py
+
