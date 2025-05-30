@@ -8,16 +8,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 
-# ====== X API AUTHENTICATION ======
 def authenticate_x_api(bearer_token):
     client = tweepy.Client(bearer_token=bearer_token)
     return client
 
-# ====== EXTRACT HASHTAGS ======
 def extract_hashtags(text):
     return re.findall(r"#\w+", str(text).lower())
 
-# ====== FETCH TWEETS ======
 def fetch_tweets(client, query, max_results=100):
     tweets = client.search_recent_tweets(query=query, tweet_fields=['created_at', 'public_metrics', 'text'], max_results=max_results)
     tweet_data = []
@@ -33,7 +30,6 @@ def fetch_tweets(client, query, max_results=100):
 
     return pd.DataFrame(tweet_data)
 
-# ====== PREPROCESS AND TRAIN ======
 def preprocess_and_train(df, weather_features=None):
     if weather_features is None:
         weather_features = ['temperature', 'humidity', 'wind_speed']
@@ -77,13 +73,25 @@ def preprocess_and_train(df, weather_features=None):
         "y_pred": y_pred
     }
 
+
 if __name__ == "__main__":
     BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAAJoq1QEAAAAAfyT9IvG9H56BDSqWKzRNNeGRh5Y%3DrHNnc33aiqyaBUvRZHkXHtIzhxg4RgwR1NOaktjFPkToGAzKgm"
     client = authenticate_x_api(BEARER_TOKEN)
 
-    ## query = "AI OR machine learning OR #DataScience lang:en -is:retweet"
+    query = "AI OR machine learning OR #DataScience lang:en -is:retweet"
     tweets_df = fetch_tweets(client, query, max_results=100)
 
+    # === Add dummy weather data (you can replace with real data later) ===
+    np.random.seed(42)
+    tweets_df['temperature'] = np.random.uniform(15, 30, size=len(tweets_df))
+    tweets_df['humidity'] = np.random.uniform(30, 80, size=len(tweets_df))
+    tweets_df['wind_speed'] = np.random.uniform(0, 10, size=len(tweets_df))
+
+    # Save to CSV
+    tweets_df.to_csv("x_posts_with_weather.csv", index=False)
+    print("Saved tweets with weather data to x_posts_with_weather.csv")
+
+    # Run your model training if you want
     results = preprocess_and_train(tweets_df)
     print(f"R² Score: {results['r2_score']:.4f}")
     print(f"RMSE: {results['rmse']:.2f}")
