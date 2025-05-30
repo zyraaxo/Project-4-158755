@@ -8,7 +8,7 @@ from prophet import Prophet
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import r2_score, mean_squared_error
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
@@ -85,16 +85,19 @@ combined_df = load_combined_data(_version=datetime.now().timestamp())
 def load_recent_news():
     try:
         newsapi = NewsApiClient(api_key="7af7d5e56edc4148aac908f2c9f86ac3")
-        start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d')
         end_date = datetime.now().strftime('%Y-%m-%d')
-        articles = newsapi.get_everything(q="*", from_param=start_date, to=end_date, language='en', page_size=1000)
+        articles = newsapi.get_everything(q="*", from_param=start_date, to=end_date, language='en', page_size=100)
         news_df = pd.DataFrame([{
             "published_at": a['publishedAt'],
             "title": a['title'],
             "description": a['description']
         } for a in articles['articles']])
-        news_df['published_at'] = pd.to_datetime(news_df['published_at'])
+        news_df['published_at'] = pd.to_datetime(news_df['published_at'], utc=True)
         news_df['text'] = news_df['title'].fillna('') + " " + news_df['description'].fillna('')
+        # Compute sentiment and topics
+        news_df['sentiment'] = news_df['text'].apply(compute_sentiment)
+        news_df['topic'] = extract_topics(news_df['text'].tolist())
         return news_df
     except Exception as e:
         st.warning(f"Failed to fetch news: {e}")
@@ -178,28 +181,64 @@ def preprocess_and_train(df, model_choice="RandomForest"):
         st.error(f"Error in training model: {e}")
         return None
 
-def hybrid_prophet_xgb(df):
+def hybrid_prophet_xgb(df, forecast_periods=24):
     try:
         logger.info("Starting hybrid Prophet+XGBoost prediction")
+        # Convert to naive datetime for Prophet (remove timezone)
         df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
         prophet_df = df[['created_at', 'engagement']].copy()
         prophet_df = prophet_df.rename(columns={'created_at': 'ds', 'engagement': 'y'})
+        prophet_df = prophet_df.dropna()
+
+        # Fit Prophet model
         m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
         m.fit(prophet_df)
-        future = m.make_future_dataframe(periods=24, freq='H')
+
+        # Create future dataframe for the next forecast_periods hours
+        future = m.make_future_dataframe(periods=forecast_periods, freq='H')
         forecast = m.predict(future)
-        prophet_features = forecast[['ds', 'trend', 'weekly', 'daily']]
+
+        # Merge Prophet features with original data
+        prophet_features = forecast[['ds', 'trend', 'weekly', 'daily']].copy()
         merged_df = df.merge(prophet_features, left_on='created_at', right_on='ds', how='left').drop(columns=['ds'])
+
+        # Prepare features for XGBoost
         features = ['sentiment', 'hour', 'is_weekend', 'trend', 'weekly', 'daily']
         merged_df = merged_df.dropna(subset=features + ['engagement'])
         if len(merged_df) < 10:
             raise ValueError("Not enough data for XGBoost training.")
+
+        # Train-test split for evaluation
         X = merged_df[features]
         y = merged_df['engagement']
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Train XGBoost model
         xgb_model = XGBRegressor(n_estimators=150, max_depth=6, learning_rate=0.1, subsample=0.8, random_state=42)
         xgb_model.fit(X_train, y_train)
         y_pred = xgb_model.predict(X_test)
+
+        # Prepare future data for prediction
+        future_df = forecast[forecast['ds'] > prophet_df['ds'].max()].copy()
+        future_df['created_at'] = pd.to_datetime(future_df['ds'])
+        future_df['hour'] = future_df['ds'].dt.hour
+        future_df['is_weekend'] = (future_df['ds'].dt.dayofweek >= 5).astype(int)
+        future_df['sentiment'] = 0.0  # Placeholder
+        future_features = future_df[['sentiment', 'hour', 'is_weekend', 'trend', 'weekly', 'daily']]
+
+        # Predict future engagement
+        future_engagement_pred = xgb_model.predict(future_features)
+
+        # Generate summaries of future predictions
+        future_summary = {
+            "average_engagement": float(np.mean(future_engagement_pred)),
+            "max_engagement": float(np.max(future_engagement_pred)),
+            "max_engagement_time": future_df['ds'].iloc[np.argmax(future_engagement_pred)].strftime('%Y-%m-%d %H:%M:%S'),
+            "min_engagement": float(np.min(future_engagement_pred)),
+            "min_engagement_time": future_df['ds'].iloc[np.argmin(future_engagement_pred)].strftime('%Y-%m-%d %H:%M:%S'),
+            "trend": "increasing" if future_engagement_pred[-1] > future_engagement_pred[0] else "decreasing"
+        }
+
         return {
             "prophet_forecast": forecast[['ds', 'yhat']],
             "xgb_model": xgb_model,
@@ -208,14 +247,85 @@ def hybrid_prophet_xgb(df):
             "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
             "X_test": X_test.assign(created_at=merged_df.loc[X_test.index, 'created_at']),
             "y_test": y_test,
-            "y_pred": y_pred
+            "y_pred": y_pred,
+            "future_dates": future_df['ds'],
+            "future_engagement_pred": future_engagement_pred,
+            "future_summary": future_summary
         }
     except Exception as e:
         logger.error(f"Hybrid model error: {str(e)}", exc_info=True)
         return None
 
+def predict_headline_features(social_df, news_df, forecast_periods=7):
+    try:
+        # Prepare features and target
+        features = ['sentiment_social', 'engagement', 'topic_social', 'is_media']
+        target_sentiment = 'sentiment_news'
+        target_topic = 'topic_news'
+
+        # Train-test split for sentiment prediction
+        X = merged_df[features].fillna(0)
+        y_sentiment = merged_df[target_sentiment].fillna(0)
+        if len(X) < 10:
+            raise ValueError("Not enough data for headline prediction (minimum 10 rows required).")
+        X_train, X_test, y_train, y_test = train_test_split(X, y_sentiment, test_size=0.2, random_state=42)
+
+        # Train sentiment prediction model
+        sentiment_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        sentiment_model.fit(X_train, y_train)
+        y_pred = sentiment_model.predict(X_test)
+        sentiment_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+        # Train topic prediction model
+        y_topic = merged_df[target_topic].astype(int)
+        topic_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        topic_model.fit(X_train, y_topic)
+        topic_accuracy = topic_model.score(X_test, y_topic)
+
+        # Forecast future social media trends (simplified)
+        future_dates = pd.date_range(start=social_df['date'].max() + pd.Timedelta(days=1), periods=forecast_periods, freq='D')
+        future_social_df = pd.DataFrame({
+            'date': future_dates,
+            'sentiment_social': social_df['sentiment_social'].mean(),  # Use average as placeholder
+            'engagement': social_df['engagement'].mean(),
+            'topic_social': social_df['topic_social'].mode()[0],
+            'is_media': social_df['is_media'].mean()
+        })
+
+        # Predict future headline features
+        future_X = future_social_df[features].fillna(0)
+        future_sentiment = sentiment_model.predict(future_X)
+        future_topics = topic_model.predict(future_X)
+
+        return {
+            'future_dates': future_dates,
+            'future_sentiment': future_sentiment,
+            'future_topics': future_topics,
+            'sentiment_rmse': sentiment_rmse,
+            'topic_accuracy': topic_accuracy
+        }
+    except Exception as e:
+        st.error(f"Headline prediction error: {e}")
+        return None
+
+def generate_headline(sentiment, topic):
+    # Map topics to keywords (based on your LDA topics)
+    topic_keywords = {
+        0: "Fitness Trends",
+        1: "Workout Tips",
+        2: "Health News"
+    }
+    # Map sentiment to tone
+    if sentiment > 0.2:
+        tone = "Positive Update"
+    elif sentiment < -0.2:
+        tone = "Concerning News"
+    else:
+        tone = "Neutral Report"
+    topic_name = topic_keywords.get(topic, "General News")
+    return f"{tone}: {topic_name} Expected to Gain Attention"
+
 # Load data
-combined_df = load_combined_data()
 if combined_df.empty:
     st.warning("No data loaded. Please check 'combined_social_data.csv'.")
     st.stop()
@@ -239,17 +349,17 @@ if filtered_df.empty:
     st.warning(f"No posts found for '{keyword}'. Check if the keyword exists in the data.")
     st.stop()
 
-    if show_news:
-        news_df = load_recent_news()
-        if not news_df.empty:
-            st.subheader("🗞 Recent News Highlights")
-            for i, row in news_df.head(5).iterrows():
-                st.markdown(f"**{row['published_at'].strftime('%Y-%m-%d %H:%M')}** - {row['title']}")
-        else:
-            st.info("No recent news available.")
+if show_news:
+    news_df = load_recent_news()
+    if not news_df.empty:
+        st.subheader("🗞 Recent News Highlights")
+        for i, row in news_df.head(5).iterrows():
+            st.markdown(f"**{row['published_at'].strftime('%Y-%m-%d %H:%M')}** - {row['title']}")
+    else:
+        st.info("No recent news available.")
 
 # Display filtered dataset details
-st.info(f"Filtered dataset sizssssse: {filtered_df.shape[0]} rows, {filtered_df.shape[1]} columns")
+st.info(f"Filtered dataset size: {filtered_df.shape[0]} rows, {filtered_df.shape[1]} columns")
 st.write(f"Filtered dataset date range: {filtered_df['created_at'].min()} to {filtered_df['created_at'].max()}")
 st.subheader("Sample of Filtered Dataset")
 st.dataframe(filtered_df[['created_at', 'text']].tail(5))  # Show last 5 rows
@@ -383,27 +493,89 @@ else:
 st.subheader("📅 Forecast with ARIMA")
 if len(time_df) >= 5:
     try:
-        model = ARIMA(time_df['engagement'], order=(1, 1, 1))
+        # Sidebar for interactive forecast period
+        forecast_periods = st.slider("Select forecast period (hours)", min_value=12, max_value=48, value=24, step=12)
+
+        # Ensure time_df.index is a DatetimeIndex
+        if not pd.api.types.is_datetime64tz_dtype(time_df.index):
+            time_df.index = pd.to_datetime(time_df.index, errors='coerce', utc=True)
+            time_df = time_df.dropna()
+            if time_df.empty:
+                st.warning("No valid datetime data for ARIMA forecast.")
+                st.stop()
+
+        # Prepare historical and future data
+        model = ARIMA(time_df['engagement'].dropna(), order=(1, 1, 1))
         model_fit = model.fit()
-        forecast_result = model_fit.get_forecast(steps=24)
+        forecast_result = model_fit.get_forecast(steps=forecast_periods)
         forecast_mean = forecast_result.predicted_mean
         forecast_ci = forecast_result.conf_int()
-        future_index = pd.date_range(start=time_df.index.max() + pd.Timedelta(hours=1), periods=24, freq='H')
-        fig, ax = plt.subplots()
-        ax.plot(future_index, forecast_mean, label='Forecasted Engagement', color='tab:blue')
-        ax.fill_between(future_index, forecast_ci.iloc[:, 0], forecast_ci.iloc[:, 1],
-                        color='blue', alpha=0.2, label='95% Confidence Interval')
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Engagement')
-        ax.set_title('ARIMA 24-Hour Engagement Forecast')
-        ax.legend()
+
+        # Create future index starting after the last historical timestamp
+        future_index = pd.date_range(
+            start=time_df.index.max() + pd.Timedelta(hours=1),
+            periods=forecast_periods,
+            freq='H',
+            tz='UTC'  # Match the timezone of the data
+        )
+        historical_index = time_df.index
+
+        # Create a full DataFrame for plotting with explicit index
+        plot_df = pd.DataFrame({
+            'engagement': pd.concat([time_df['engagement'].dropna(), pd.Series(forecast_mean, index=future_index)]),
+            'lower_ci': pd.concat([pd.Series([np.nan] * len(historical_index)), forecast_ci.iloc[:, 0]]),
+            'upper_ci': pd.concat([pd.Series([np.nan] * len(historical_index)), forecast_ci.iloc[:, 1]])
+        }).reset_index().rename(columns={'index': 'timestamp'})
+        plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'])
+        plot_df.set_index('timestamp', inplace=True)
+
+        # Plotting with dual axes
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        ax1.plot(plot_df.index, plot_df['engagement'], label='Historical & Forecasted Engagement', color='tab:blue')
+        ax1.fill_between(plot_df.index, plot_df['lower_ci'], plot_df['upper_ci'],
+                         color='blue', alpha=0.2, label='95% Confidence Interval')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Engagement', color='tab:blue')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
+
+        # Customize x-axis for readability
+        key_times = [historical_index[0], historical_index[-1], future_index[0], future_index[-1]]
+        ax1.set_xticks(key_times)
+        ax1.set_xticklabels([t.strftime('%Y-%m-%d %H:%M') for t in key_times], rotation=45, ha='right')
+
+        # Add summary statistics
+        forecast_values = forecast_mean.values
+        summary = {
+            "average_forecast": float(np.mean(forecast_values)),
+            "max_forecast": float(np.max(forecast_values)),
+            "max_time": future_index[np.argmax(forecast_values)].strftime('%Y-%m-%d %H:%M'),
+            "min_forecast": float(np.min(forecast_values)),
+            "min_time": future_index[np.argmin(forecast_values)].strftime('%Y-%m-%d %H:%M'),
+            "trend": "increasing" if forecast_values[-1] > forecast_values[0] else "decreasing"
+        }
+        st.write("**Forecast Summary**")
+        st.write(f"- Average Forecasted Engagement: {summary['average_forecast']:.2f}")
+        st.write(f"- Maximum Forecasted Engagement: {summary['max_forecast']:.2f} at {summary['max_time']}")
+        st.write(f"- Minimum Forecasted Engagement: {summary['min_forecast']:.2f} at {summary['min_time']}")
+        st.write(f"- Trend: {summary['trend'].capitalize()}")
+
+        # Backtest RMSE
+        if len(time_df) >= 24:
+            actual = time_df['engagement'].iloc[-24:].values
+            predicted = model_fit.predict(start=len(time_df)-24, end=len(time_df)-1)
+            rmse = np.sqrt(np.mean((actual - predicted)**2))
+            st.info(f"RMSE (last 24h backtest): {rmse:.2f}")
+        else:
+            st.info("Insufficient data for 24h backtest (less than 24 hours available).")
+
+        # Add legend and title
+        ax1.legend(loc='upper left')
+        plt.title('ARIMA Engagement Forecast')
         st.pyplot(fig)
-        actual = time_df['engagement'].iloc[-24:].values
-        predicted = model_fit.predict(start=len(time_df)-24, end=len(time_df)-1)
-        rmse = np.sqrt(np.mean((actual - predicted)**2))
-        st.info(f"RMSE (last 24h backtest): {rmse:.2f}")
+
     except Exception as e:
         st.warning(f"ARIMA Forecast failed: {e}")
+        logger.error(f"ARIMA error: {str(e)}", exc_info=True)
 else:
     st.warning("Insufficient data for ARIMA forecast (minimum 5 data points).")
 
@@ -446,18 +618,48 @@ except Exception as e:
 st.subheader("Hybrid Prophet + XGBoost Forecast")
 try:
     with st.spinner("Training hybrid model..."):
-        result = hybrid_prophet_xgb(filtered_df)
+        result = hybrid_prophet_xgb(filtered_df, forecast_periods=24)  # Predict next 24 hours
     if result:
         st.success("Hybrid model trained successfully!")
         st.write(f"**R² Score**: {result['r2_score']:.2f}")
         st.write(f"**RMSE**: {result['rmse']:.2f}")
+
+        # Plot historical Prophet forecast
+        st.subheader("📈 Historical Prophet Forecast")
         fig = plt.figure(figsize=(12, 6))
         plt.plot(result['prophet_forecast']['ds'], result['prophet_forecast']['yhat'], label='Prophet Forecast')
         plt.xlabel('Time')
         plt.ylabel('Engagement')
-        plt.title('Prophet Time Series Forecast')
+        plt.title('Prophet Time Series Forecast (Historical)')
         plt.legend()
         st.pyplot(fig)
+
+        # Plot future engagement predictions
+        st.subheader("🎯 Future Engagement Prediction (Next 24 Hours)")
+        future_df = pd.DataFrame({
+            'Date': result['future_dates'],
+            'Predicted Engagement': result['future_engagement_pred']
+        })
+        future_df['Date'] = pd.to_datetime(future_df['Date'])
+        future_df.set_index('Date', inplace=True)
+        st.line_chart(future_df['Predicted Engagement'])
+
+        # Display future predictions table
+        st.write("**Future Engagement Predictions Table**")
+        st.dataframe(future_df.reset_index())
+
+        # Display summaries
+        st.subheader("📊 Summary of Future Engagement Predictions")
+        summary = result['future_summary']
+        st.write(f"- **Average Predicted Engagement**: {summary['average_engagement']:.2f}")
+        st.write(f"- **Maximum Predicted Engagement**: {summary['max_engagement']:.2f}")
+        st.write(f"  - **Peak Time**: {summary['max_engagement_time']}")
+        st.write(f"- **Minimum Predicted Engagement**: {summary['min_engagement']:.2f}")
+        st.write(f"  - **Low Point Time**: {summary['min_engagement_time']}")
+        st.write(f"- **Trend Over the Period**: {summary['trend'].capitalize()}")
+
+        # Plot test set comparison
+        st.subheader("📉 Test Set Comparison")
         chart_df = result['X_test'].copy()
         chart_df['Predicted Engagement'] = result['y_pred']
         chart_df['Actual Engagement'] = result['y_test'].values
@@ -470,6 +672,83 @@ try:
 except Exception as e:
     st.error(f"Hybrid model error: {e}")
 
+## Predict News Headlines
+st.subheader("📰 Predicted News Headlines Based on Engagement Trends")
+# Daily aggregation of social media data
+daily_social_df = filtered_df.groupby(filtered_df['created_at'].dt.floor('D')).agg({
+    'sentiment': 'mean',
+    'engagement': 'sum',
+    'topic': lambda x: x.mode()[0] if not x.mode().empty else 0,
+    'is_media': 'mean'
+}).dropna()
+daily_social_df.index.name = 'date'
+daily_social_df.reset_index(inplace=True)
+daily_social_df['date'] = pd.to_datetime(daily_social_df['date']).dt.tz_localize(None)  # Convert to naive datetime
+st.write("**Daily Social Media Data (Sample):**", daily_social_df.head())  # Debug output
+
+# Fallback: Load sample data if daily_social_df is empty
+if daily_social_df.empty:
+    st.warning("No aggregated social media data. Using sample data.")
+    daily_social_df = pd.read_csv("2025-05-30T04-41_export.csv")
+    daily_social_df['date'] = pd.to_datetime(daily_social_df['date'])
+    daily_social_df['is_media'] = 0  # Add missing column with default value
+    st.write("**Sample Social Media Data (Fallback):**", daily_social_df.head())
+
+# Aggregate news data daily (extended to 14 days for more overlap)
+news_df = load_recent_news()
+if not news_df.empty:
+    news_daily = news_df.groupby(news_df['published_at'].dt.floor('D')).agg({
+        'sentiment': 'mean',
+        'topic': lambda x: x.mode()[0] if not x.mode().empty else 0
+    }).dropna()
+    news_daily.index.name = 'date'
+    news_daily.reset_index(inplace=True)
+    news_daily['date'] = pd.to_datetime(news_daily['date']).dt.tz_localize(None)  # Convert to naive datetime
+    st.write("**Daily News Data (Sample):**", news_daily.head())  # Debug output
+else:
+    st.warning("No news data available for headline prediction.")
+    merged_df = pd.DataFrame()
+
+# Merge social media and news data
+if not news_df.empty:
+    merged_df = pd.merge(daily_social_df, news_daily, on='date', how='inner', suffixes=('_social', '_news'))
+    st.write(f"**Merged Data Size**: {merged_df.shape[0]} rows")  # Debug output
+    st.write("**Merged Data (Sample):**", merged_df.head())  # Additional debug output
+else:
+    merged_df = pd.DataFrame()
+
+if not merged_df.empty:
+    try:
+        with st.spinner("Predicting future headlines..."):
+            headline_result = predict_headline_features(daily_social_df, news_df, forecast_periods=7)  # Predict next 7 days
+        if headline_result:
+            st.success("Headline prediction completed!")
+            st.write(f"**Sentiment Prediction RMSE**: {headline_result['sentiment_rmse']:.2f}")
+            st.write(f"**Topic Prediction Accuracy**: {headline_result['topic_accuracy']:.2f}")
+
+            # Display predicted headlines
+            future_headlines = pd.DataFrame({
+                'Date': headline_result['future_dates'],
+                'Predicted Sentiment': headline_result['future_sentiment'],
+                'Predicted Topic': headline_result['future_topics']
+            })
+            future_headlines['Headline'] = future_headlines.apply(
+                lambda row: generate_headline(row['Predicted Sentiment'], row['Predicted Topic']), axis=1
+            )
+            st.write("**Predicted Headlines for the Next 7 Days**")
+            st.dataframe(future_headlines[['Date', 'Headline', 'Predicted Sentiment']])
+
+            # Plot predicted sentiment over time
+            st.subheader("📈 Predicted Headline Sentiment Trend")
+            sentiment_trend = pd.DataFrame({
+                'Date': headline_result['future_dates'],
+                'Predicted Sentiment': headline_result['future_sentiment']
+            }).set_index('Date')
+            st.line_chart(sentiment_trend['Predicted Sentiment'])
+    except Exception as e:
+        st.error(f"Failed to predict headlines: {e}")
+else:
+    st.warning("No merged social and news data available for headline prediction.")
 # Regression Model
 st.subheader("📈 Predict Engagement (Regression)")
 try:
