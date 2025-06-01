@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
@@ -7,18 +8,21 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from prophet import Prophet
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, RandomizedSearchCV
+from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, RandomForestClassifier
-from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.api import VAR
 from xgboost import XGBRegressor
-import numpy as np
 import logging
 from datetime import datetime, timedelta
 from newsapi import NewsApiClient
+import warnings
+
+
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -155,35 +159,80 @@ def extract_topics(texts):
 def drop_constant_columns(df):
     return df.loc[:, df.nunique() > 1]
 
-def preprocess_and_train(df, model_choice="RandomForest"):
+
+
+
+
+warnings.filterwarnings("ignore")  # For cleaner output
+
+def preprocess_and_train(df: pd.DataFrame, model_choice: str = "RandomForest"):
     try:
         features = ['sentiment', 'text_length', 'hashtag_count', 'is_media', 'hour', 'is_weekend']
-        X = df[features].fillna(0)
-        y = df['engagement'].fillna(0)
-        if len(X) < 10:
-            raise ValueError("Not enough data for training (minimum 10 rows required).")
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X = df[features].fillna(df[features].median())
+        y = df['engagement'].fillna(df['engagement'].median())
+
+        if len(X) < 30:
+            raise ValueError("Not enough data for training (minimum 30 rows recommended).")
+
+        y_log = np.log1p(y)
+
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        X_train, X_test, y_train_log, y_test_log = train_test_split(X_scaled, y_log, test_size=0.2, random_state=42)
+
         if model_choice == "RandomForest":
-            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            model = RandomForestRegressor(random_state=42)
+            param_dist = {
+                'n_estimators': [100, 200, 300],
+                'max_depth': [None, 10, 20, 30],
+                'min_samples_split': [2, 5, 10],
+                'min_samples_leaf': [1, 2, 4],
+                'max_features': ['auto', 'sqrt', 'log2']
+            }
         else:
-            model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
+            model = GradientBoostingRegressor(random_state=42)
+            param_dist = {
+                'n_estimators': [100, 200, 300],
+                'learning_rate': [0.01, 0.05, 0.1],
+                'max_depth': [3, 5, 7],
+                'subsample': [0.8, 1.0],
+                'min_samples_split': [2, 5, 10]
+            }
+
+        search = RandomizedSearchCV(
+            model, param_distributions=param_dist, n_iter=20,
+            scoring='neg_mean_squared_error', cv=3, n_jobs=-1, random_state=42
+        )
+        search.fit(X_train, y_train_log)
+        best_model = search.best_estimator_
+
+        y_pred_log = best_model.predict(X_test)
+        y_pred = np.expm1(y_pred_log)
+        y_test = np.expm1(y_test_log)
+
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+
         return {
-            'r2_score': r2_score(y_test, y_pred),
-            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-            'X_test': X_test,
+            'r2_score': r2,
+            'rmse': rmse,
+            'mae': mae,
+            'X_test': pd.DataFrame(X_test, columns=features),
             'y_test': y_test,
-            'y_pred': y_pred
+            'y_pred': y_pred,
+            'model': best_model
         }
+
     except Exception as e:
-        st.error(f"Error in training model: {e}")
+        print(f"Error in training model: {e}")
         return None
+
 
 def hybrid_prophet_xgb(df, forecast_periods=24):
     try:
         logger.info("Starting hybrid Prophet+XGBoost prediction")
-        # Convert to naive datetime for Prophet (remove timezone)
         df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
         prophet_df = df[['created_at', 'engagement']].copy()
         prophet_df = prophet_df.rename(columns={'created_at': 'ds', 'engagement': 'y'})
@@ -530,6 +579,15 @@ try:
         chart_df = result['X_test'].copy()
         chart_df['Predicted Engagement'] = result['y_pred']
         chart_df['Actual Engagement'] = result['y_test'].values
+        rmse = np.sqrt(mean_squared_error(chart_df['Actual Engagement'], chart_df['Predicted Engagement']))
+        mae = mean_absolute_error(chart_df['Actual Engagement'], chart_df['Predicted Engagement'])
+        r2 = r2_score(chart_df['Actual Engagement'], chart_df['Predicted Engagement'])
+
+        st.subheader("📊 Summary Statistics")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("RMSE", f"{rmse:.2f}")
+        col2.metric("MAE", f"{mae:.2f}")
+        col3.metric("R² Score", f"{r2:.2f}")
         if 'created_at' in chart_df.columns and not chart_df['created_at'].isnull().any():
             chart_df = chart_df.set_index('created_at')
             st.line_chart(chart_df[['Predicted Engagement', 'Actual Engagement']])
@@ -548,8 +606,8 @@ daily_social_df = filtered_df.groupby(filtered_df['created_at'].dt.floor('D')).a
 }).dropna()
 daily_social_df.index.name = 'date'
 daily_social_df.reset_index(inplace=True)
-daily_social_df['date'] = pd.to_datetime(daily_social_df['date']).dt.tz_localize(None)  # Convert to naive datetime
-st.write("**Daily Social Media Data (Sample):**", daily_social_df.head())  # Debug output
+daily_social_df['date'] = pd.to_datetime(daily_social_df['date']).dt.tz_localize(None)
+st.write("**Daily Social Media Data (Sample):**", daily_social_df.head())
 
 if daily_social_df.empty:
     st.warning("No aggregated social media data. Using sample data.")
@@ -566,16 +624,16 @@ if not news_df.empty:
     }).dropna()
     news_daily.index.name = 'date'
     news_daily.reset_index(inplace=True)
-    news_daily['date'] = pd.to_datetime(news_daily['date']).dt.tz_localize(None)  # Convert to naive datetime
-    st.write("**Daily News Data (Sample):**", news_daily.head())  # Debug output
+    news_daily['date'] = pd.to_datetime(news_daily['date']).dt.tz_localize(None)
+    st.write("**Daily News Data (Sample):**", news_daily.head())
 else:
     st.warning("No news data available for headline prediction.")
     merged_df = pd.DataFrame()
 
 if not news_df.empty:
     merged_df = pd.merge(daily_social_df, news_daily, on='date', how='inner', suffixes=('_social', '_news'))
-    st.write(f"**Merged Data Size**: {merged_df.shape[0]} rows")  # Debug output
-    st.write("**Merged Data (Sample):**", merged_df.head())  # Additional debug output
+    st.write(f"**Merged Data Size**: {merged_df.shape[0]} rows")
+    st.write("**Merged Data (Sample):**", merged_df.head())
 else:
     merged_df = pd.DataFrame()
 
@@ -620,14 +678,21 @@ try:
         chart_df = result['X_test'].copy()
         chart_df['Predicted Engagement'] = result['y_pred']
         chart_df['Actual Engagement'] = result['y_test'].values
-        fig, ax = plt.subplots()
-        ax.plot(chart_df.index, chart_df['Predicted Engagement'], label='Predicted', color='tab:purple')
-        ax.plot(chart_df.index, chart_df['Actual Engagement'], label='Actual', color='tab:red')
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(chart_df['Actual Engagement'], chart_df['Predicted Engagement'], alpha=0.6, edgecolors='w',
+                   color='tab:purple')
+        ax.plot([chart_df['Actual Engagement'].min(), chart_df['Actual Engagement'].max()],
+                [chart_df['Actual Engagement'].min(), chart_df['Actual Engagement'].max()], 'r--', lw=2,
+                label='Perfect Prediction')
         ax.set_title('Predicted vs Actual Engagement')
-        ax.set_xlabel('Post Index')
-        ax.set_ylabel('Engagement')
+        ax.set_xlabel('Actual Engagement')
+        ax.set_ylabel('Predicted Engagement')
         ax.legend()
+        ax.grid(True)
+
         st.pyplot(fig)
+
 
 except Exception as e:
     st.error(f"Regression model error: {e}")
