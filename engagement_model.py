@@ -7,6 +7,8 @@ from textblob import TextBlob
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
+### USED TO GET X DATA, WILL ONLY RUN ONCE A MONTH DUE TO X DEV FREE ACCOUNT LIMITS
+
 
 def authenticate_x_api(bearer_token):
     client = tweepy.Client(bearer_token=bearer_token)
