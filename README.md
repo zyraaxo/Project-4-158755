@@ -1,8 +1,7 @@
 Project 4 (158755) – Real-Time Social Media Trend Forecaster
 
 Overview
-This project delivers a real-time trend forecasting web app that analyzes world-related hashtags (e.g., #Fitness, #Climate Change, #Ukraine) on X and Reddit posts combined. It combines social media data with current news headlines (via the News API)  Using NLP and machine learning, it extracts trending keywords, predicts post engagement (likes and retweets, upvotes), and forecasts topic popularity over 24–48 hours. The tool is deployed as an interactive Streamlit dashboard, offering visualizations like word clouds and trend curves. A Jupyter notebook documents the full data science workflow.
-
+This project delivers a real-time trend forecasting web app with a primary focus on analyzing fitness-related hashtags (e.g., #Fitness, #Workout, #HealthyLiving) on X and Reddit posts, while also supporting other topics like #ClimateChange and #Ukraine. It integrates social media data with current news headlines (via the News API) and uses NLP and machine learning to extract trending fitness keywords, predict post engagement (likes, retweets, upvotes) for fitness content, and forecast the popularity of fitness topics over 24–48 hours. The tool is deployed as an interactive Streamlit dashboard, featuring visualizations like word clouds and trend curves, with a strong emphasis on fitness trends. A Jupyter notebook documents the full data science workflow, highlighting the analysis and modeling for fitness-related data.
 Problem Statement:
 Trends on X emerge and fade rapidly. Marketers, influencers, and researchers often struggle to anticipate these shifts. This project addresses that challenge by forecasting trend lifecycles, helping users optimize content timing and stay ahead of competitors.
 
