@@ -374,7 +374,7 @@ st.subheader("Sample of Raw Dataset")
 st.dataframe(combined_df[['created_at', 'text']].tail(5))  # Show last 5 rows
 
 st.sidebar.title("Filter Settings")
-keyword = st.sidebar.text_input("Enter a topic keyword:", "Fitness").lower().replace("#", "")
+keyword = st.sidebar.text_input("Enter a topic keyword (To see all data ensure input box is empty and press enter):", "Fitness").lower().replace("#", "")
 show_news = st.sidebar.checkbox("📰 Show Latest News Headlines")
 model_choice = st.sidebar.selectbox("Select Regression Model", ["RandomForest", "GradientBoosting"])
 
