@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 
 from mergeData import combined_df
 
+## WAS USED FOR THE NEWS API, FULL IMPLEMENTATION WAS NOT COMPLETED
+
+
 newsapi = NewsApiClient(api_key="7af7d5e56edc4148aac908f2c9f86ac3")
 
 # Define time range
